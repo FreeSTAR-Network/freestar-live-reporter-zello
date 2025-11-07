@@ -15,8 +15,6 @@ from datetime import datetime, timedelta, timezone
 from pyogg.opus_decoder import OpusDecoder
 from pyogg.opus_encoder import OpusEncoder
 
-from .stream import AsyncByteStream
-
 
 AUTH_TOKEN_EXPIRY = 3600
 AUTH_TOKEN_EXPIRY_THRESHOLD = 600
@@ -42,14 +40,8 @@ def socket_setup_keepalive(sock):
 
 class ZelloController:
 
-    def __init__(self,
-                 stream_in: AsyncByteStream,
-                 stream_out: AsyncByteStream,
-                 usrp_ptt: asyncio.Event,
-                 zello_ptt: asyncio.Event):
+    def __init__(self):
         self._logger = logging.getLogger('ZelloController')
-        self._stream_out = stream_out
-        self._stream_in = stream_in
         self._stream_id = None
         self._seq = 0
 
@@ -57,8 +49,7 @@ class ZelloController:
         self._refresh_token = None
         self._logged_in = False
 
-        self._usrp_ptt = usrp_ptt
-        self._zello_ptt = zello_ptt
+        self._zello_ptt = asyncio.Event()
 
         self._ws = None
         self._txing = False
@@ -239,8 +230,7 @@ class ZelloController:
         try:
             self._tasks = [
                 asyncio.create_task(self.run_rx()),
-                asyncio.create_task(self.monitor()),
-                asyncio.create_task(self.run_tx())
+                asyncio.create_task(self.monitor())
             ]
             await asyncio.gather(*self._tasks)
         except Exception as e:
@@ -389,202 +379,6 @@ class ZelloController:
             self._logger.error(f'Failed to send stop_stream: {e}')
         self._usrp_tx_start = None
         self._txing = False
-
-    async def run_tx(self):
-        if self._logger.isEnabledFor(logging.DEBUG):
-            self._logger.debug('run_tx starting')
-        encoder = OpusEncoder()
-        encoder.set_application('voip')
-        encoder.set_sampling_frequency(8000)
-        encoder.set_channels(1)
-        try:
-            comp = int(os.getenv('OPUS_COMPLEXITY', '5'))
-            try:
-                encoder.set_complexity(comp)
-            except Exception:
-                pass
-            br_env = os.getenv('OPUS_BITRATE', '')
-            if br_env:
-                try:
-                    encoder.set_bitrate(int(br_env))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        sending = False
-        first_pcm_logged = False
-        pcm = []
-        try:
-            while not self._shutdown:
-                await asyncio.sleep(MAIN_LOOP_YIELD_SEC)
-                now = datetime.now(timezone.utc)
-                # auth watchdog here too for extra safety
-                if self._auth_in_progress and self._auth_started_at is not None:
-                    if (time.monotonic() - self._auth_started_at) > AUTH_WATCHDOG_SEC:
-                        self._logger.warning(
-                            "Auth watchdog (TX loop) tripped; clearing auth_in_progress")
-                        self._auth_in_progress = False
-                        self._auth_started_at = None
-                        self._auth_seq = None
-
-                if self._ws is None or self._ws.closed:
-                    await asyncio.sleep(0.5)
-                    continue
-                if self._woodpecker_until and now < self._woodpecker_until:
-                    if not self._in_woodpecker_backoff and self._logger.isEnabledFor(logging.DEBUG):
-                        self._logger.debug(
-                            f"Woodpecker backoff until {self._woodpecker_until}")
-                        self._in_woodpecker_backoff = True
-                    await asyncio.sleep(0.05)
-                    continue
-                if self._in_woodpecker_backoff and (not self._woodpecker_until or now >= self._woodpecker_until):
-                    if self._logger.isEnabledFor(logging.DEBUG):
-                        self._logger.debug(
-                            "Woodpecker backoff ended, resuming TX attempts")
-                    self._in_woodpecker_backoff = False
-                if self._empty_msg_backoff_until and now < self._empty_msg_backoff_until:
-                    if not self._in_empty_backoff and self._logger.isEnabledFor(logging.DEBUG):
-                        self._logger.debug(
-                            f"Empty-message backoff until {self._empty_msg_backoff_until}")
-                        self._in_empty_backoff = True
-                    await asyncio.sleep(0.05)
-                    continue
-                if self._in_empty_backoff and (not self._empty_msg_backoff_until or now >= self._empty_msg_backoff_until):
-                    if self._logger.isEnabledFor(logging.DEBUG):
-                        self._logger.debug(
-                            "Empty-message backoff ended, resuming TX attempts")
-                    self._in_empty_backoff = False
-
-                try:
-                    if not self._usrp_ptt.is_set():
-                        if self._ptt_down_at:
-                            dur = (now - self._ptt_down_at).total_seconds()
-                            self._logger.info(f'UnKeyed:USRP ({dur:.1f}s)')
-                            if self._logger.isEnabledFor(logging.DEBUG):
-                                self._logger.debug(
-                                    f"USRP PTT released at {now}")
-                            self._ptt_down_at = None
-                        if sending:
-                            sending = False
-                            first_pcm_logged = False
-                            await self._end_tx()
-                        await asyncio.sleep(PTT_IDLE_SLEEP_SEC)
-                        continue
-                    else:
-                        if self._ptt_down_at is None:
-                            self._ptt_down_at = now
-                            self._logger.info('Keyed:USRP')
-                            if self._logger.isEnabledFor(logging.DEBUG):
-                                self._logger.debug(
-                                    f"USRP PTT down at {self._ptt_down_at}")
-                        if (datetime.now(timezone.utc) - self._ptt_down_at).total_seconds() < 0.15:
-                            await asyncio.sleep(0.01)
-                            continue
-
-                    try:
-                        pcm = await asyncio.wait_for(self._stream_in.read(640), timeout=1)
-                    except asyncio.TimeoutError:
-                        self._stat_read_timeouts += 1
-                        self._debug_skip("stream_in read timeout")
-                        pcm = []
-                        if sending:
-                            await self._end_tx()
-                            sending = False
-                            first_pcm_logged = False
-                        continue
-                    if not pcm:
-                        self._debug_skip("empty PCM")
-                        continue
-                    if len(pcm) < 320:
-                        self._debug_skip("short PCM (<320)")
-                        continue
-                    if self._zello_ptt.is_set():
-                        self._debug_skip("RX in progress (zello_ptt set)")
-                        continue
-                    if not self._logged_in:
-                        self._debug_skip("not logged in")
-                        continue
-                    if self._auth_in_progress:
-                        self._debug_skip("auth in progress")
-                        continue
-                    if not self._channel_ready:
-                        if self._channel_backoff_until and now < self._channel_backoff_until:
-                            remaining = (
-                                self._channel_backoff_until - now).total_seconds()
-                            self._debug_skip(
-                                f"channel not ready ({remaining:.2f}s left)")
-                        else:
-                            self._debug_skip("channel not ready")
-                        continue
-                    if self._last_login_at and (now - self._last_login_at).total_seconds() < POST_LOGIN_COOLDOWN_SEC:
-                        remaining = POST_LOGIN_COOLDOWN_SEC - \
-                            (now - self._last_login_at).total_seconds()
-                        self._debug_skip(
-                            f"post-login cooldown ({max(0.0, remaining):.2f}s left)")
-                        continue
-                    if self._start_retry_after and now < self._start_retry_after:
-                        remaining = (self._start_retry_after -
-                                     now).total_seconds()
-                        self._debug_skip(
-                            f"waiting retry window ({remaining:.2f}s left)")
-                        continue
-
-                    if not first_pcm_logged and self._ptt_down_at:
-                        if self._logger.isEnabledFor(logging.DEBUG):
-                            latency_ms = (datetime.now(
-                                timezone.utc) - self._ptt_down_at).total_seconds() * 1000.0
-                            self._logger.debug(
-                                f"First PCM after PTT: {latency_ms:.1f} ms (len={len(pcm)})")
-                        first_pcm_logged = True
-
-                    if not sending:
-                        test_pcm = pcm
-                        if not test_pcm or len(test_pcm) < 320:
-                            self._debug_skip("prebuffer short")
-                            continue
-                        await self.start_tx()
-                        if not self._txing or self._stream_id is None:
-                            self._debug_skip("start_tx failed or no stream_id")
-                            continue
-
-                    opus = encoder.encode(pcm)
-                    sending = True
-                    if self._stream_id is not None and isinstance(self._stream_id, int):
-                        frame = struct.pack(
-                            '>bii', 1, self._stream_id, self._pkt_id) + opus
-                        self._pkt_id = (self._pkt_id + 1) & 0x7FFFFFFF
-                        if self._ws is not None and not self._ws.closed:
-                            try:
-                                await self._ws.send_bytes(frame)
-                                self._frame_count += 1
-                                self._frame_bytes += len(opus)
-                                self._frame_summary_maybe_emit()
-                            except Exception as e:
-                                self._logger.error(
-                                    f'Failed to send audio frame: {e}')
-                                sending = False
-                                first_pcm_logged = False
-                                await self._end_tx()
-                    else:
-                        self._logger.warning(
-                            f'Invalid stream_id: {self._stream_id}, stopping transmission')
-                        sending = False
-                        first_pcm_logged = False
-                        await self._end_tx()
-                except asyncio.TimeoutError:
-                    pcm = []
-                    if sending:
-                        await self._end_tx()
-                        sending = False
-                        first_pcm_logged = False
-                    continue
-        except asyncio.CancelledError:
-            if self._logger.isEnabledFor(logging.DEBUG):
-                self._logger.debug('TX task cancelled')
-            if sending:
-                await self._end_tx()
-        except Exception as e:
-            self._logger.error(f'TX task error: {e}')
 
     async def run_rx(self):
         if self._logger.isEnabledFor(logging.DEBUG):
@@ -818,17 +612,10 @@ class ZelloController:
                                     if self._logger.isEnabledFor(logging.DEBUG):
                                         self._logger.debug(
                                             f"RX BINARY {len(msg.data)} bytes")
-                                    try:
-                                        data = msg.data[9:]
-                                        pcm = decoder.decode(bytearray(data))
-                                        await self._stream_out.write(pcm)
-                                    except Exception as e:
-                                        self._logger.error(
-                                            f'Failed to decode audio: {e} bytes={len(msg.data)}')
                                 else:
                                     self._logger.warning(
                                         f'Unhandled message: {msg}')
-                    except (aiohttp.ClientConnectorError, aiohttp.ClientConnectorDNSError) as e:
+                    except aiohttp.ClientConnectorError as e:
                         self._logger.warning(f'Connection error: {e}')
                         if self._logger.isEnabledFor(logging.DEBUG):
                             self._logger.debug(
